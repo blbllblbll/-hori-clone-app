@@ -30,7 +30,7 @@ yarn-error.*
 .DS_Store
 *.pem
 
-# local env files
+# local env overrides (never commit real secrets here)
 .env*.local
 
 # typescript
@@ -39,7 +39,3 @@ yarn-error.*
 # generated native folders
 /ios
 /android
-
-
-# env
-.env
