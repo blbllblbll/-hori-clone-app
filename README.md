@@ -26,7 +26,7 @@ src/
   lib/
     sajuCalculator.ts          사주/음력/점성술 계산 (계산과 해석의 분리)
     horiPersonaPrompt.ts       "호리" 페르소나 시스템 프롬프트
-    claudeClient.ts            Claude 호출은 항상 Edge Function(chat)을 경유
+    claudeClient.ts            Claude 호출은 항상 Edge Function(chat-with-hori)을 경유
     adAndDonationHandler.ts    리워드 광고 + IAP 후원 클라이언트 로직
     supabaseClient.ts
   context/                     Auth / Credits / BirthProfile 전역 상태
@@ -36,7 +36,7 @@ src/
 supabase/
   schema.sql                   users/saju_profiles/messages/ad_reward_logs/processed_receipts
   functions/
-    chat/                      Claude 프록시 + 크레딧 차감 (서버에서만 수행)
+    chat-with-hori/            Claude 프록시 + 크레딧 차감 (서버에서만 수행)
     grant-ad-credit/           광고 시청 보상 지급
     verify-donation-receipt/   IAP 영수증 검증 + 크레딧 지급
 ```
@@ -44,7 +44,7 @@ supabase/
 ## 핵심 설계 원칙 (docs/design/app-architecture.md 4절)
 
 - **계산과 해석의 분리**: 간지/행성 위치는 라이브러리로만 계산하고, Claude에게는
-  결과만 넘겨 해석시킨다 (`sajuCalculator.ts` → `chat` Edge Function).
+  결과만 넘겨 해석시킨다 (`sajuCalculator.ts` → `chat-with-hori` Edge Function).
 - **크레딧은 서버 전용**: 클라이언트는 `users.credits`를 직접 증감하지 않는다.
   광고 시청/IAP 결제/채팅 차감 모두 Edge Function(서비스 롤)에서만 처리한다.
 - **자미두수 명반**: 공개 라이브러리가 없어 현재는 자리표시자(`ZiweiSummaryCard`)만
@@ -73,7 +73,7 @@ supabase login
 supabase link --project-ref <project-ref>
 supabase db push            # supabase/schema.sql 적용
 supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
-supabase functions deploy chat
+supabase functions deploy chat-with-hori
 supabase functions deploy grant-ad-credit
 supabase functions deploy verify-donation-receipt
 ```

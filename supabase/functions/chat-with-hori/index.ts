@@ -6,7 +6,7 @@
  * (docs/design/credit-system-design.md, docs/design/app-architecture.md 4절).
  *
  * 배포:
- *   supabase functions deploy chat
+ *   supabase functions deploy chat-with-hori
  *   supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
  */
 import { createClient } from 'jsr:@supabase/supabase-js@2';
