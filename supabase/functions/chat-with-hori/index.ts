@@ -8,8 +8,12 @@
  * 배포:
  *   supabase functions deploy chat-with-hori
  *   supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
+ *
+ * 요청 인증: Authorization 헤더는 프로젝트 anon/publishable key가 아니라
+ * 실제 로그인된 사용자의 access_token(JWT)이어야 한다. supabaseAdmin.auth.getUser(jwt)로
+ * 검증하며, 실패하면 401을 반환한다 (크레딧/프로필 조회에 사용자 식별이 필요하기 때문).
  */
-import { createClient } from 'jsr:@supabase/supabase-js@2';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { corsHeaders } from '../_shared/cors.ts';
 
 const CHAT_CREDIT_COST = 1;
@@ -58,65 +62,122 @@ const CATEGORY_LABELS: Record<string, string> = {
   today: '오늘의 운세',
 };
 
-const supabaseAdmin = createClient(
-  Deno.env.get('SUPABASE_URL')!,
-  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
-);
+// deno-lint-ignore no-explicit-any
+let supabaseAdmin: any = null;
+let bootError: string | null = null;
+
+// 모듈 최상단에서 createClient()가 던지면 함수 전체가 부팅에 실패해서
+// Deno.serve 핸들러조차 등록되지 않고, Invocations/Logs에도 아무 기록이
+// 남지 않는다. 그래서 top-level에서 바로 생성하지 않고 지연 초기화해서,
+// 실패하더라도 최소한 요청을 받아 원인을 응답/로그로 남길 수 있게 한다.
+function getSupabaseAdmin() {
+  if (supabaseAdmin) return supabaseAdmin;
+  if (bootError) throw new Error(bootError);
+
+  const url = Deno.env.get('SUPABASE_URL');
+  const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+  if (!url || !serviceRoleKey) {
+    bootError = `SUPABASE_URL 또는 SUPABASE_SERVICE_ROLE_KEY 환경변수가 없어요 (url=${!!url}, serviceRoleKey=${!!serviceRoleKey})`;
+    throw new Error(bootError);
+  }
+
+  supabaseAdmin = createClient(url, serviceRoleKey);
+  return supabaseAdmin;
+}
 
 Deno.serve(async (req: Request) => {
+  console.log(`[chat-with-hori] ${req.method} 요청 수신`);
+
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
   }
 
+  let stage = 'init';
+
   try {
+    stage = 'supabase-client-init';
+    const admin = getSupabaseAdmin();
+
+    stage = 'auth-header-check';
     const authHeader = req.headers.get('Authorization');
     if (!authHeader) {
-      return json({ error: '인증이 필요해요' }, 401);
+      console.warn('[chat-with-hori] Authorization 헤더 없음');
+      return json({ error: '인증이 필요해요', stage }, 401);
     }
 
+    stage = 'auth-verify';
     const jwt = authHeader.replace('Bearer ', '');
-    const { data: authData, error: authError } = await supabaseAdmin.auth.getUser(jwt);
+    const { data: authData, error: authError } = await admin.auth.getUser(jwt);
     if (authError || !authData.user) {
-      return json({ error: '인증에 실패했어요' }, 401);
+      console.warn('[chat-with-hori] JWT 검증 실패', authError?.message);
+      return json({ error: '인증에 실패했어요. anon/publishable key가 아니라 로그인된 사용자의 access_token이 필요해요.', stage }, 401);
     }
     const userId = authData.user.id;
+    console.log(`[chat-with-hori] 인증된 사용자: ${userId}`);
 
-    const { conversationId, category, message } = await req.json();
-    if (!conversationId || !category || !message) {
-      return json({ error: '필수 값이 없어요' }, 400);
+    stage = 'parse-body';
+    let body: { conversationId?: string; category?: string; message?: string };
+    try {
+      body = await req.json();
+    } catch (parseError) {
+      console.error('[chat-with-hori] 요청 바디 JSON 파싱 실패', parseError);
+      return json({ error: '요청 바디가 올바른 JSON이 아니에요', stage }, 400);
     }
 
-    const { data: userRow, error: userError } = await supabaseAdmin
+    const { conversationId, category, message } = body;
+    if (!conversationId || !category || !message) {
+      console.warn('[chat-with-hori] 필수 값 누락', { conversationId, category, message });
+      return json({ error: 'conversationId, category, message가 모두 필요해요', stage }, 400);
+    }
+
+    stage = 'load-credits';
+    const { data: userRow, error: userError } = await admin
       .from('users')
       .select('credits')
       .eq('id', userId)
       .single();
 
     if (userError || !userRow) {
-      return json({ error: '사용자를 찾을 수 없어요' }, 404);
+      console.error('[chat-with-hori] users 조회 실패', userError?.message);
+      return json({ error: '사용자를 찾을 수 없어요', stage }, 404);
     }
 
     if (userRow.credits < CHAT_CREDIT_COST) {
-      return json({ error: '질문권이 부족해요' }, 402);
+      console.log(`[chat-with-hori] 크레딧 부족 (남은 크레딧: ${userRow.credits})`);
+      return json({ error: '질문권이 부족해요', stage }, 402);
     }
 
-    const { data: profile } = await supabaseAdmin
+    stage = 'load-saju-profile';
+    const { data: profile, error: profileError } = await admin
       .from('saju_profiles')
       .select('analysis')
       .eq('user_id', userId)
       .maybeSingle();
 
+    if (profileError) {
+      console.error('[chat-with-hori] saju_profiles 조회 실패', profileError.message);
+      return json({ error: '분석 데이터를 조회하지 못했어요', stage, detail: profileError.message }, 500);
+    }
     if (!profile) {
-      return json({ error: '먼저 생년월일 분석을 완료해주세요' }, 400);
+      console.warn('[chat-with-hori] saju_profiles 없음');
+      return json({ error: '먼저 생년월일 분석을 완료해주세요', stage }, 400);
     }
 
-    const { data: history } = await supabaseAdmin
+    stage = 'load-history';
+    const { data: history, error: historyError } = await admin
       .from('messages')
       .select('role, content')
       .eq('conversation_id', conversationId)
       .order('created_at', { ascending: true })
       .limit(20);
 
+    if (historyError) {
+      console.error('[chat-with-hori] messages 조회 실패', historyError.message);
+      return json({ error: '대화 기록을 조회하지 못했어요', stage, detail: historyError.message }, 500);
+    }
+
+    stage = 'build-prompt';
     const systemPrompt = HORI_SYSTEM_PROMPT_TEMPLATE.replace(
       '{{계산결과}}',
       formatAnalysisContext(profile.analysis)
@@ -127,29 +188,51 @@ Deno.serve(async (req: Request) => {
       { role: 'user', content: message },
     ];
 
-    const reply = await callClaude(systemPrompt, claudeMessages);
+    stage = 'call-claude';
+    const reply = await callClaude(systemPrompt, claudeMessages, stage);
 
+    stage = 'persist-and-charge';
     const newBalance = userRow.credits - CHAT_CREDIT_COST;
 
-    await supabaseAdmin.from('messages').insert([
+    const { error: insertError } = await admin.from('messages').insert([
       { conversation_id: conversationId, user_id: userId, role: 'user', category, content: message },
       { conversation_id: conversationId, user_id: userId, role: 'assistant', category, content: reply },
     ]);
-    await supabaseAdmin.from('users').update({ credits: newBalance }).eq('id', userId);
+    if (insertError) {
+      console.error('[chat-with-hori] messages 저장 실패', insertError.message);
+    }
 
+    const { error: updateError } = await admin.from('users').update({ credits: newBalance }).eq('id', userId);
+    if (updateError) {
+      console.error('[chat-with-hori] credits 업데이트 실패', updateError.message);
+    }
+
+    console.log(`[chat-with-hori] 응답 완료 (남은 크레딧: ${newBalance})`);
     return json({ reply, remainingCredits: newBalance }, 200);
   } catch (error) {
-    console.error(error);
-    return json({ error: '알 수 없는 오류가 발생했어요' }, 500);
+    const message = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error ? error.stack : undefined;
+    console.error(`[chat-with-hori] 처리 실패 (stage=${stage})`, message, stack);
+    return json({ error: '알 수 없는 오류가 발생했어요', stage, detail: message }, 500);
   }
 });
 
-async function callClaude(system: string, messages: { role: string; content: string }[]): Promise<string> {
+async function callClaude(
+  system: string,
+  messages: { role: string; content: string }[],
+  stage: string
+): Promise<string> {
+  const apiKey = Deno.env.get('ANTHROPIC_API_KEY');
+  if (!apiKey) {
+    console.error(`[chat-with-hori] ANTHROPIC_API_KEY 시크릿이 설정되지 않았어요 (stage=${stage})`);
+    throw new Error('ANTHROPIC_API_KEY 시크릿이 설정되지 않았어요. supabase secrets set ANTHROPIC_API_KEY=... 로 등록해주세요.');
+  }
+
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-api-key': Deno.env.get('ANTHROPIC_API_KEY')!,
+      'x-api-key': apiKey,
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
@@ -162,11 +245,16 @@ async function callClaude(system: string, messages: { role: string; content: str
 
   if (!response.ok) {
     const errorBody = await response.text();
+    console.error(`[chat-with-hori] Claude API 오류 (${response.status})`, errorBody);
     throw new Error(`Claude API 오류 (${response.status}): ${errorBody}`);
   }
 
   const data = await response.json();
-  return data.content?.[0]?.text ?? '';
+  const text = data.content?.[0]?.text;
+  if (!text) {
+    console.error('[chat-with-hori] Claude 응답에 text가 없어요', JSON.stringify(data));
+  }
+  return text ?? '';
 }
 
 // deno-lint-ignore no-explicit-any
